@@ -1,0 +1,284 @@
+# Base repo: Nerqiva/Reuseable-Github-Actions
+# (spelling is deliberate — see AGENTS.md; GHCR image paths are lowercase)
+# See README.md for the adoption manual and adaptation checklist.
+#
+# Copy and adapt this file into your own repository. Do NOT reference this repo
+# from another workflow with `uses:` — consumers own the copy (AGENTS.md).
+#
+# This workflow builds and publishes a multi-arch Docker image to GHCR.
+# This repo ships no Dockerfile, so every build knob is parameterised:
+#   workflow_dispatch input  ->  repository Variable  ->  documented default.
+# On a `push` event the inputs are all empty strings, so the repository Variable
+# is what makes the workflow work unattended. The exact variable name for each
+# input is named in a comment beside it.
+
+name: Publish Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Full image reference. Empty => ghcr.io/<owner>/<repo> (lowercased). Repo Variable: IMAGE_NAME'
+        required: false
+        default: ''
+      dockerfile:
+        description: 'Path to the Dockerfile. Repo Variable: DOCKERFILE'
+        required: false
+        default: './Dockerfile'
+      context:
+        description: 'Build context directory. Repo Variable: BUILD_CONTEXT'
+        required: false
+        default: '.'
+      target:
+        description: 'Build stage/target name. Empty = the Dockerfile default stage. Repo Variable: BUILD_TARGET'
+        required: false
+        default: ''
+      platforms:
+        description: 'Comma-separated target platforms. Repo Variable: PLATFORMS'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+      build_args:
+        description: 'Newline-separated KEY=value build args. Repo Variable: BUILD_ARGS'
+        required: false
+        default: ''
+      push:
+        # Deliberately a STRING, not `type: boolean`. GitHub expressions treat
+        # `false` as falsy, so a boolean input would make `inputs.push || ...`
+        # fall through to the default and a user asking for a build-only dry run
+        # would get a real push. The string 'false' is truthy and survives the
+        # fallback chain; the resolve step parses and validates it.
+        description: "Push the image to the registry. 'false' = build-only dry run. Repo Variable: PUSH"
+        required: false
+        default: 'true'
+      allow_existing_version:
+        # String for the same reason as `push` above.
+        description: "Recovery hatch only: downgrade a version collision to a warning ('false' = fail). Repo Variable: ALLOW_EXISTING_VERSION"
+        required: false
+        default: 'false'
+      tags:
+        description: 'Newline-separated extra tags, applied IN ADDITION to the CalVer tag and latest. Repo Variable: EXTRA_TAGS'
+        required: false
+        default: ''
+
+  # Every commit to the default branch publishes. That is the entire reason MICRO
+  # exists: it is what keeps two commits on the same UTC day from colliding.
+  # There is deliberately no `tags:` trigger here — pushing a tag must not
+  # produce a second publish, and tag-driven publication is release-binaries.yml.
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+# cancel-in-progress: false on purpose. A cancelled half-publish leaves a tag or
+# an image behind that no release points at; that is precisely the state the
+# collision guard in scripts/compute-calver.sh exists to catch. Letting the
+# earlier run finish is always safer than superseding it.
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------- version job
+  # MUST complete before any build: nothing may be built or pushed until the
+  # CalVer collision guard has passed.
+  version:
+    name: Resolve CalVer version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calver.outputs.version }}
+      day: ${{ steps.calver.outputs.day }}
+      micro: ${{ steps.calver.outputs.micro }}
+      commit_date: ${{ steps.calver.outputs.commit_date }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          # fetch-depth: 0 is MANDATORY, not an optimisation. MICRO is a count of
+          # commits on the commit's UTC day; a shallow clone silently produces a
+          # smaller, wrong number. The script refuses to run shallow.
+          fetch-depth: 0
+
+      - name: Compute CalVer version and guard against overwrites
+        id: calver
+        run: ./scripts/compute-calver.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLOW_EXISTING_VERSION: ${{ inputs.allow_existing_version || vars.ALLOW_EXISTING_VERSION || 'false' }}
+
+  # --------------------------------------------------------------- publish job
+  publish:
+    name: Build and push image
+    needs: version
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      image: ${{ steps.digest.outputs.image }}
+      version: ${{ steps.digest.outputs.version }}
+    steps:
+      - name: Resolve build configuration
+        id: config
+        env:
+          # Input -> repo Variable -> default. On push events inputs.* are empty.
+          IMAGE_NAME: ${{ inputs.image_name || vars.IMAGE_NAME }}
+          DOCKERFILE: ${{ inputs.dockerfile || vars.DOCKERFILE || './Dockerfile' }}
+          BUILD_CONTEXT: ${{ inputs.context || vars.BUILD_CONTEXT || '.' }}
+          BUILD_TARGET: ${{ inputs.target || vars.BUILD_TARGET }}
+          PLATFORMS: ${{ inputs.platforms || vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+          BUILD_ARGS: ${{ inputs.build_args || vars.BUILD_ARGS }}
+          PUSH: ${{ inputs.push || vars.PUSH || 'true' }}
+          EXTRA_TAGS: ${{ inputs.tags || vars.EXTRA_TAGS }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # GHCR namespaces are case-sensitive and must be lowercase.
+          image="${IMAGE_NAME:-ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')}"
+
+          # Re-defaulted here as well as in the expression above, so that a
+          # consumer who edits the `env:` wiring cannot accidentally leave the
+          # build with no platforms or silently downgrade it to build-only.
+          platforms="${PLATFORMS:-linux/amd64,linux/arm64}"
+          case "$(printf '%s' "$PUSH" | tr '[:upper:]' '[:lower:]')" in
+            true | 1 | yes) push=true ;;
+            false | 0 | no | '') push=false ;;
+            *)
+              echo "::error::push must be true or false, got '$PUSH'."
+              exit 1
+              ;;
+          esac
+
+          # build-args must be a JSON array. An empty input must yield [] and never
+          # null or [""], which would silently pass an empty ARG to the Dockerfile.
+          # -R -s reads the raw text as one string; split on newlines, drop blanks.
+          build_args_json="$(printf '%s\n' "$BUILD_ARGS" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+          if [ "$build_args_json" != "[]" ] && ! printf '%s' "$build_args_json" | jq -e 'type == "array" and all(.[]; type == "string" and contains("="))' >/dev/null; then
+            echo "::error::build_args must be a newline-separated list of KEY=value entries; got: $build_args_json"
+            exit 1
+          fi
+
+          # Inject the resolved CalVer version as a build arg so the image can
+          # bake in its own version. An explicit VERSION= in BUILD_ARGS wins,
+          # so a consumer that manages the version elsewhere is not overridden.
+          if ! printf '%s' "$build_args_json" | jq -e 'any(.[]; startswith("VERSION="))' >/dev/null 2>&1; then
+            build_args_json="$(printf '%s' "$build_args_json" | jq -c --arg v "VERSION=${VERSION}" '. + [$v]')"
+          fi
+
+          # Tag set: the immutable CalVer tag, then the one and only mutable tag.
+          # `latest` is GHCR-only and is pushed in the SAME step as the CalVer tag
+          # so it can never describe a different build than the tag beside it.
+          tags_file="$(mktemp)"
+          {
+            printf 'type=raw,value=%s\n' "$VERSION"
+            printf 'type=raw,value=latest\n'
+            if [ -n "$EXTRA_TAGS" ]; then
+              while IFS= read -r line; do
+                line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+                line="${line%"${line##*[![:space:]]}"}"   # rtrim
+                case "$line" in
+                  '' | '#'*) continue ;;
+                esac
+                case "$line" in
+                  *[!a-zA-Z0-9._-]*)
+                    echo "::error::invalid character in extra tag '$line'. Tags may only use [a-zA-Z0-9._-]."
+                    exit 1
+                    ;;
+                esac
+                printf 'type=raw,value=%s\n' "$line"
+              done <<<"$EXTRA_TAGS"
+            fi
+          } >"$tags_file"
+          tags="$(cat "$tags_file")"
+          rm -f "$tags_file"
+
+          {
+            echo "image=${image}"
+            echo "push=${push}"
+            echo "platforms=${platforms}"
+            echo "dockerfile=${DOCKERFILE:-./Dockerfile}"
+            echo "context=${BUILD_CONTEXT:-.}"
+            echo "build_target=${BUILD_TARGET:-}"
+            echo "build_args_json=${build_args_json}"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo 'tags<<__TAGS_EOF__'
+            printf '%s\n' "$tags"
+            echo '__TAGS_EOF__'
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Resolved image=${image} push=${push} platforms=${platforms} version=${VERSION}"
+          printf 'Resolved tag set:\n%s\n' "$tags" >&2
+
+      # buildx is required for multi-platform builds and for the type=gha cache
+      # layer. Pinned to a version tag like every other third-party action here.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          # Per-run token, scoped by the permissions: block at the top of this
+          # file. No personal token, no literal credential, ever.
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata and tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.config.outputs.image }}
+          # The CalVer tag (immutable) and latest (mutable, GHCR-only), plus any
+          # extra tags from the `tags` input, each as its own type=raw entry.
+          tags: ${{ steps.config.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ needs.version.outputs.commit_date }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=${{ vars.IMAGE_LICENSE || 'unknown' }}
+
+      # Every build knob below is read from the resolve step's outputs, not
+      # re-derived here. One resolution point means an edited fallback chain
+      # cannot diverge between the step that resolves it and the step that uses it.
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ steps.config.outputs.context }}
+          file: ${{ steps.config.outputs.dockerfile }}
+          target: ${{ steps.config.outputs.build_target }}
+          platforms: ${{ steps.config.outputs.platforms }}
+          push: ${{ steps.config.outputs.push }}
+          # One single push for the whole tag set. Two steps would leave the
+          # image addressable under a version whose second push failed.
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.config.outputs.build_args_json }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Step outputs are untrusted input: they are passed through env and never
+      # interpolated directly into the shell text.
+      - name: Record and report the published digest
+        id: digest
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_IMAGE: ${{ steps.config.outputs.image }}
+          BUILD_TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          {
+            echo "digest=${BUILD_DIGEST}"
+            echo "image=${BUILD_IMAGE}"
+            echo "version=${VERSION}"
+          } >>"$GITHUB_OUTPUT"
+          echo "Published ${VERSION} as ${BUILD_IMAGE}@${BUILD_DIGEST:-<none: build-only run, push was disabled>}"
+          printf 'tags:\n%s\n' "$BUILD_TAGS" | sed 's/^/  /'

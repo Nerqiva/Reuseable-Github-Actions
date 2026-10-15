@@ -1,0 +1,29 @@
+# Dependabot configuration for the reusable-actions reference repo.
+#
+# WHY the docker/* actions are grouped into a single PR:
+#   docker/metadata-action generates the tag list (CalVer version + `latest`)
+#   that docker/build-push-action then pushes, and docker/login-action supplies
+#   the GHCR session both of those consume. The three are version-coupled: a
+#   partial bump -- metadata-action on a new major while build-push-action is
+#   still on the old one -- breaks the tag-generation contract and the push
+#   fails at the registry. Bumping them together keeps the contract intact.
+#
+# There is deliberately no `actions` ecosystem entry: this repository ships
+# workflows and scripts only, with no local composite actions to keep in step.
+
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      docker-actions:
+        patterns:
+          - "docker/*"
+      other-actions:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "docker/*"

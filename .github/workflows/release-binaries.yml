@@ -1,0 +1,453 @@
+# Base repo: Nerqiva/Reuseable-Github-Actions
+# (spelling is deliberate — see AGENTS.md; GHCR image paths are lowercase)
+# See README.md for the adoption manual and adaptation checklist.
+#
+# Copy and adapt this file into your own repository. Do NOT reference this repo
+# from another workflow with `uses:` — consumers own the copy (AGENTS.md).
+#
+# Compiles Debian-compatible Linux binaries for amd64 and arm64 and attaches
+# them to a GitHub Release named by CalVer version.
+#
+# INVARIANT — binaries carry NO floating mutable tag. A container-registry
+# mutable pointer is meaningless for a tarball: users address a binary release
+# solely by its immutable CalVer version. The container registry workflow is the
+# only file in this repo that publishes a floating pointer, and the CalVer
+# collision guard (scripts/compute-calver.sh) is what keeps both honest.
+
+name: Release binaries
+
+on:
+  # Tag-driven publication. Pushing a `v*` tag is the explicit opt-in.
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      build_command:
+        description: 'Shell command that produces the binary. Empty => vars.BINARY_BUILD_COMMAND. Required.'
+        required: false
+        default: ''
+      binary_name:
+        description: 'Executable file name produced in $OUT_DIR. Empty => vars.BINARY_NAME. Required.'
+        required: false
+        default: ''
+      cgo_enabled:
+        description: 'CGO_ENABLED for the build. "0" keeps output static and Debian-compatible. Repo Variable: CGO_ENABLED'
+        required: false
+        default: '0'
+      strip_binary:
+        description: 'Run strip on the binary before packaging. Repo Variable: STRIP_BINARY'
+        required: false
+        default: 'true'
+      verify_image:
+        description: 'Container image used to prove the binary runs on Debian. Repo Variable: VERIFY_IMAGE'
+        required: false
+        default: 'debian:bookworm-slim'
+      allow_existing_version:
+        # Deliberately a STRING, not `type: boolean`. GitHub expressions treat
+        # `false` as falsy, so a boolean input would make
+        # `inputs.allow_existing_version || ...` fall through and the run would
+        # silently ignore an explicit "off". The string 'false' is truthy and
+        # survives the fallback chain; the script compares it literally.
+        description: "Recovery hatch only: downgrade a version collision to a warning ('false' = fail). Repo Variable: ALLOW_EXISTING_VERSION"
+        required: false
+        default: 'false'
+
+permissions:
+  # contents: write is required to push a tag and to create the release.
+  contents: write
+
+# cancel-in-progress: false on purpose. A cancelled run mid-publish can leave a
+# tag without a release, or a release without its assets; letting the earlier run
+# finish is always safer than superseding it.
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------- version job
+  # Single normalising job so the release job can never disagree with the image
+  # version: tag-triggered runs use the pushed tag verbatim, dispatch-triggered
+  # runs call the same CalVer script the image workflow uses.
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.final.outputs.version }}
+      source: ${{ steps.final.outputs.source }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          # fetch-depth: 0 is MANDATORY: MICRO is a count of commits on the
+          # commit's UTC day, and a shallow clone silently under-counts it.
+          fetch-depth: 0
+
+      - name: Select the version source
+        id: src
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = "tag" ]; then
+            # INVARIANT: the tag already exists and is never re-created or moved.
+            # It is used verbatim — nothing is stripped or rewritten. It only has
+            # to look like a CalVer version, otherwise this workflow would publish
+            # binaries under a scheme the image workflow never uses.
+            if ! printf '%s' "$REF_NAME" | grep -Eq '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$'; then
+              echo "::error::tag '${REF_NAME}' does not match the required CalVer form vYYYY.MM.DD.MICRO (e.g. v2026.10.14.3). Refusing to publish binaries under a non-CalVer version."
+              exit 1
+            fi
+            {
+              echo "source=tag"
+              echo "version=${REF_NAME}"
+            } >>"$GITHUB_OUTPUT"
+          else
+            # Dispatch: derive the version with the same script, and therefore the
+            # same guard, the image workflow uses.
+            echo "source=calver" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute CalVer version and guard against overwrites
+        id: calver
+        if: steps.src.outputs.source == 'calver'
+        run: ./scripts/compute-calver.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLOW_EXISTING_VERSION: ${{ inputs.allow_existing_version || vars.ALLOW_EXISTING_VERSION || 'false' }}
+          ALLOW_EXISTING_TAG: 'false'
+
+      - name: Guard against an existing release for the tag
+        # Tag-triggered: the tag is expected to exist because it started this
+        # run, so its existence is not a collision. The release check still runs
+        # and still fails if a release for this version already exists.
+        id: guard
+        if: steps.src.outputs.source == 'tag'
+        run: ./scripts/compute-calver.sh "$REF_NAME"
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLOW_EXISTING_VERSION: ${{ inputs.allow_existing_version || vars.ALLOW_EXISTING_VERSION || 'false' }}
+          ALLOW_EXISTING_TAG: 'true'
+
+      - name: Assert the pushed tag is the CalVer version of its own commit
+        if: steps.src.outputs.source == 'tag'
+        env:
+          TAG_VERSION: ${{ steps.src.outputs.version }}
+          COMPUTED_VERSION: ${{ steps.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The guard above checks the release for the version CALCULATED from the
+          # tagged commit. That is only the version about to be published if the
+          # tag and the computation agree. A hand-made tag that is not its own
+          # commit's CalVer would make the collision check query a version this
+          # run is not releasing, which is worse than no check at all because it
+          # looks like one.
+          if [ "$TAG_VERSION" != "$COMPUTED_VERSION" ]; then
+            echo "::error::tag '${TAG_VERSION}' is not the CalVer version of its own commit (which is '${COMPUTED_VERSION}'). Refusing to publish: the collision guard would have checked a version this run is not releasing."
+            exit 1
+          fi
+          echo "Tag ${TAG_VERSION} matches the CalVer version of its commit."
+
+      - name: Publish the resolved version
+        id: final
+        env:
+          SOURCE: ${{ steps.src.outputs.source }}
+          TAG_VERSION: ${{ steps.src.outputs.version }}
+          CALVER_VERSION: ${{ steps.calver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE" = "tag" ]; then
+            version="$TAG_VERSION"
+          else
+            version="$CALVER_VERSION"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$'; then
+            echo "::error::resolved version '${version}' is not a CalVer version of the form vYYYY.MM.DD.MICRO."
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "source=${SOURCE}"
+          } >>"$GITHUB_OUTPUT"
+          echo "Releasing ${version} (source: ${SOURCE})"
+
+  # ---------------------------------------------------------------- build job
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: version
+    # Cross-compilation for a Debian-compatible static target needs a full Linux
+    # toolchain; runners other than ubuntu-latest do not guarantee it.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build binary
+        env:
+          # CONTRACT with the consuming repository (see README.md):
+          #   the build command runs with $GOOS, $GOARCH, $CGO_ENABLED, $VERSION
+          #   and $OUT_DIR in the environment, and MUST leave a single
+          #   executable at $OUT_DIR/$BINARY_NAME. Example:
+          #     go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+          #       -o "$OUT_DIR/$BINARY_NAME" ./cmd/<name>
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ inputs.cgo_enabled || vars.CGO_ENABLED || '0' }}
+          VERSION: ${{ needs.version.outputs.version }}
+          OUT_DIR: ${{ runner.temp }}/out
+          BINARY_NAME: ${{ inputs.binary_name || vars.BINARY_NAME }}
+          BUILD_COMMAND: ${{ inputs.build_command || vars.BINARY_BUILD_COMMAND }}
+        run: |
+          set -euo pipefail
+
+          # Fail loudly. A silent no-op would produce an empty release that looks
+          # like a successful publish.
+          if [ -z "${BUILD_COMMAND:-}" ]; then
+            echo "::error::No build command configured. Set the repository variable vars.BINARY_BUILD_COMMAND, or pass the build_command input. This repository ships no application language, so the build command is a required consumer input."
+            exit 1
+          fi
+          if [ -z "${BINARY_NAME:-}" ]; then
+            echo "::error::No binary name configured. Set the repository variable vars.BINARY_NAME, or pass the binary_name input. The build command must produce \$OUT_DIR/\$BINARY_NAME and the packaging step needs to know that name."
+            exit 1
+          fi
+
+          mkdir -p "$OUT_DIR"
+
+          # CGO_ENABLED=0 is the default and is what makes the output
+          # Debian-compatible: a fully static binary with no glibc coupling, so
+          # it runs on bookworm, trixie, Ubuntu and anything newer.
+          # WARNING: setting vars.CGO_ENABLED=1 reintroduces a glibc dependency
+          # and requires pinning the glibc baseline in a Debian builder image
+          # (and then re-verifying on that same image) — do not flip it casually.
+          if [ "$CGO_ENABLED" = "1" ]; then
+            echo "::warning::CGO_ENABLED=1 makes the binary depend on the builder's glibc. Pin the glibc baseline in a Debian builder image and set vars.VERIFY_IMAGE to that same image."
+          fi
+          if [ "$CGO_ENABLED" != "0" ] && [ "$CGO_ENABLED" != "1" ]; then
+            echo "::error::CGO_ENABLED must be 0 or 1, got '$CGO_ENABLED'."
+            exit 1
+          fi
+
+          # eval is required: BUILD_COMMAND is a command *string* supplied by the
+          # consumer, so it must expand $VERSION / $OUT_DIR / $GOOS / $GOARCH.
+          # It is the consumer's own repository variable, never external input.
+          echo "Building ${BINARY_NAME} for ${GOOS}/${GOARCH} (CGO_ENABLED=${CGO_ENABLED}, VERSION=${VERSION})"
+          eval "$BUILD_COMMAND"
+
+          if [ ! -f "$OUT_DIR/$BINARY_NAME" ]; then
+            echo "::error::Build command finished but $OUT_DIR/$BINARY_NAME does not exist. The contract is: the command must place a single executable at \$OUT_DIR/\$BINARY_NAME."
+            exit 1
+          fi
+          chmod +x "$OUT_DIR/$BINARY_NAME"
+
+      - name: Package archive
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          GOOS: ${{ matrix.goos }}
+          VERSION: ${{ needs.version.outputs.version }}
+          OUT_DIR: ${{ runner.temp }}/out
+          STAGE_DIR: ${{ runner.temp }}/stage
+          BINARY_NAME: ${{ inputs.binary_name || vars.BINARY_NAME }}
+          STRIP_BINARY: ${{ inputs.strip_binary || vars.STRIP_BINARY || 'true' }}
+        run: |
+          set -euo pipefail
+          stage="$STAGE_DIR"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp "$OUT_DIR/$BINARY_NAME" "$stage/$BINARY_NAME"
+
+          # Ship the licence and the readme with the binary when they exist.
+          for extra in README.md LICENSE LICENSE.md LICENSE.txt COPYING; do
+            [ -f "$extra" ] && cp "$extra" "$stage/"
+          done
+
+          if [ "$STRIP_BINARY" = "true" ]; then
+            # `strip` is a no-op for languages whose toolchain already strips,
+            # and a warning (not a failure) when the file is not an ELF binary.
+            if command -v strip >/dev/null 2>&1; then
+              strip --strip-unneeded "$stage/$BINARY_NAME" \
+                || echo "::warning::strip failed for $BINARY_NAME; shipping it unstripped."
+            fi
+          fi
+
+          mkdir -p dist
+          # Reproducible: fixed owner, numeric ids, fixed mtime, sorted entries,
+          # permissions normalised so the runner's umask cannot leak into the
+          # archive, and gzip -n so no filename or timestamp is embedded.
+          archive="dist/${BINARY_NAME}-${VERSION}-${GOOS}-${GOARCH}.tar.gz"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@0" --format=gnu --mode='u+rwX,go+rX,go-w' \
+            -cf - -C "$stage" . \
+            | gzip -9 -n >"$archive"
+          echo "Packaged $archive ($(stat -c%s "$archive") bytes)"
+          tar -tzf "$archive"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          # Per-arch artifact names keep the assets distinct on download.
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------- verify job
+  # Real verification, not decoration: the binary must actually execute inside a
+  # real Debian userland. A build-only pipeline that never runs the artifact
+  # proves nothing about Debian compatibility.
+  verify:
+    name: Verify on ${{ matrix.goarch }}
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - name: Download archive
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: verify
+
+      - name: Extract archive
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p verify/run
+          mapfile -t archives < <(find verify -type f -name '*.tar.gz')
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one archive for linux/${GOARCH}, found ${#archives[@]}"
+            exit 1
+          fi
+          tar -xzf "${archives[0]}" -C verify/run
+
+      # Registers the binfmt handlers that let the amd64 runner execute the arm64
+      # binary. Pinned to a version tag like every other third-party action here.
+      # Only needed for the foreign architecture; the amd64 leg runs natively.
+      - name: Install QEMU emulators
+        if: matrix.goarch != 'amd64'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Verify the binary runs on Debian
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          # Consumers whose build intentionally targets a different distro
+          # override vars.VERIFY_IMAGE. It must be an image in which the binary
+          # is expected to work — that is the whole point of the check.
+          VERIFY_IMAGE: ${{ inputs.verify_image || vars.VERIFY_IMAGE || 'debian:bookworm-slim' }}
+        run: |
+          set -euo pipefail
+          # The archive deliberately also ships README and LICENSE, so the
+          # executable is identified by its executable bit rather than by being
+          # the only file in the archive.
+          mapfile -t binaries < <(find verify/run -maxdepth 1 -type f -perm -u+x | sort)
+          if [ "${#binaries[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one executable in the archive for linux/$GOARCH, found ${#binaries[@]}"
+            find verify/run -maxdepth 1 -type f -printf '  %M %p\n' 2>/dev/null || true
+            exit 1
+          fi
+          binary="$(basename "${binaries[0]}")"
+          echo "Verifying $binary (linux/$GOARCH) inside $VERIFY_IMAGE"
+
+          # $PWD is mounted read-only: the container must never be able to
+          # mutate the assets it is being judged on.
+          docker pull "$VERIFY_IMAGE"
+          if ! output="$(docker run --rm -v "$PWD:/w:ro" "$VERIFY_IMAGE" "/w/verify/run/$binary" --version 2>&1)"; then
+            echo "::error::$binary failed to execute on $VERIFY_IMAGE (linux/$GOARCH)."
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          echo "::notice::$binary executed successfully on $VERIFY_IMAGE (linux/$GOARCH)"
+
+  # ------------------------------------------------------------- release job
+  # Runs only after verification passed. No floating mutable tag exists for
+  # binaries; the version is the only address there is.
+  release:
+    name: Create release
+    needs: [version, build, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          # Needed to create and push the tag in the dispatch case, and to see
+          # the commits behind --generate-notes.
+          fetch-depth: 0
+
+      - name: Download all per-arch archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          # merge-multiple: false keeps each arch in its own subdirectory so the
+          # amd64 and arm64 assets never collide or overwrite one another.
+          merge-multiple: false
+
+      - name: Collect assets
+        id: assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find dist -type f -name '*.tar.gz' | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::no release archives were downloaded for ${VERSION}; refusing to publish an empty release."
+            exit 1
+          fi
+          printf '%s\n' "${assets[@]}" | sed 's/^/  /'
+          {
+            echo "count=${#assets[@]}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Push the version tag
+        if: needs.version.outputs.source == 'calver'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The collision guard in the version job already failed if this tag
+          # existed. This creates it exactly once. There is deliberately no -f /
+          # --force / --force-with-lease anywhere: an existing tag must never be
+          # moved, and overwriting one is a hard error in this repo.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release ${VERSION}"
+          git push origin "refs/tags/${VERSION}"
+
+      - name: Create the GitHub release
+        env:
+          # Per-run token, scoped by the permissions: block at the top of this
+          # file. Never echoed, never logged.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find dist -type f -name '*.tar.gz' | sort)
+          printf '%s\n' "${assets[@]}" | sed 's/^/  /'
+          # --verify-tag: refuse to create a release whose tag is not on the
+          # remote. --clobber is intentionally NOT passed: an existing release
+          # failing here is the no-overwrite guard working as designed.
+          gh release create "$VERSION" "${assets[@]}" \
+            --title "$VERSION" \
+            --generate-notes \
+            --verify-tag

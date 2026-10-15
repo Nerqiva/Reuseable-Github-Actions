@@ -1,0 +1,22 @@
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+
+# IDE directories
+.idea/
+.vscode/
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~
+
+# Local dependencies (no application language is built here, but tooling
+# experiments and one-off scripts leave these behind)
+node_modules/
+
+# Stray backups from the owner's *.bak-<timestamp> convention
+*.bak-*
+
+# NOTE: scripts/ and .github/ are deliberately NOT ignored. They are the
+# product of this repository.
