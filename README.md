@@ -137,6 +137,7 @@ Also read, for image labels only: `IMAGE_LICENSE` (defaults to `unknown`).
 | `cgo_enabled` | `CGO_ENABLED` | string | `0` | `0` keeps the output static and Debian-compatible. |
 | `strip_binary` | `STRIP_BINARY` | string `true`\|`false` | `true` | Strip before packaging. |
 | `verify_image` | `VERIFY_IMAGE` | string | `debian:bookworm-slim` | Container used to prove the binary actually runs. |
+| `prerelease` | `PRERELEASE` | string `true`\|`false` | `false` | Mark the release as a pre-release. A pre-release is still immutable — promoting one to a full release later is a deliberate act on the same version, never a re-publish under a new one. |
 | `allow_existing_version` | `ALLOW_EXISTING_VERSION` | string `true`\|`false` | `false` | **Recovery hatch only.** Leave it off. |
 
 Architectures are a build matrix in the workflow (`linux/amd64`, `linux/arm64`),

@@ -42,6 +42,11 @@ on:
         description: 'Container image used to prove the binary runs on Debian. Repo Variable: VERIFY_IMAGE'
         required: false
         default: 'debian:bookworm-slim'
+      prerelease:
+        # String, for the same reason as allow_existing_version below.
+        description: "Mark the release as a pre-release ('true'/'false'). Repo Variable: PRERELEASE"
+        required: false
+        default: 'false'
       allow_existing_version:
         # Deliberately a STRING, not `type: boolean`. GitHub expressions treat
         # `false` as falsy, so a boolean input would make
@@ -440,14 +445,31 @@ jobs:
           # file. Never echoed, never logged.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease || vars.PRERELEASE || 'false' }}
         run: |
           set -euo pipefail
           mapfile -t assets < <(find dist -type f -name '*.tar.gz' | sort)
           printf '%s\n' "${assets[@]}" | sed 's/^/  /'
+
+          # A pre-release is still immutable: --prerelease only changes the badge,
+          # it does not change the tag or the assets. Promoting one to a full
+          # release later is a deliberate act on that same version, never a
+          # re-publish under a new one.
+          prerelease_flag=()
+          case "$(printf '%s' "$PRERELEASE" | tr '[:upper:]' '[:lower:]')" in
+            true | 1 | yes) prerelease_flag=(--prerelease) ;;
+            false | 0 | no | '') prerelease_flag=() ;;
+            *)
+              echo "::error::prerelease must be true or false, got '$PRERELEASE'."
+              exit 1
+              ;;
+          esac
+
           # --verify-tag: refuse to create a release whose tag is not on the
           # remote. --clobber is intentionally NOT passed: an existing release
           # failing here is the no-overwrite guard working as designed.
           gh release create "$VERSION" "${assets[@]}" \
             --title "$VERSION" \
             --generate-notes \
-            --verify-tag
+            --verify-tag \
+            "${prerelease_flag[@]}"
