@@ -106,10 +106,18 @@ Consumers are expected to record the adoption in their own `README.md` or
 
 ## Repo identity note
 
-The repository is `Nerqiva/Reuseable-Github-Actions`. The spelling is
-deliberately as-is: **do not "correct" it in URLs or image paths.** GHCR
-namespace paths must be lowercase, so the image reference is written
-lowercase even though the repo name is not.
+The repository is
+[`Nerqiva/Reuseable-Github-Actions`](https://github.com/Nerqiva/Reuseable-Github-Actions),
+public. The spelling is deliberately as-is: **do not "correct" it in URLs or
+image paths.** GHCR namespace paths must be lowercase, so the image reference
+is written lowercase even though the repo name is not.
+
+Commit author is the GitHub noreply address
+`31291110+panicstack@users.noreply.github.com`, set **locally** in this
+repository only. The global `~/.gitconfig` identity stays
+`toufr12@gmail.com`; GitHub rejects pushes exposing that private address into
+an unverified org, and a local override is the narrowest fix. Do not change the
+global identity, and do not propagate the override to other repositories.
 
 ## Still open
 

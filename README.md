@@ -14,9 +14,10 @@ from silently replacing a published artefact.
 > refactor upstream breaks your release, and you inherit failures from a change
 > you never reviewed. Copy the file, then own it.
 
-Repository: `Nerqiva/Reuseable-Github-Actions` — the spelling is deliberate and
-must not be "corrected" in image paths. GHCR namespace paths are lowercase
-regardless: `ghcr.io/nerqiva/reuseable-github-actions`.
+Repository: [`Nerqiva/Reuseable-Github-Actions`](https://github.com/Nerqiva/Reuseable-Github-Actions)
+— the spelling is deliberate and must not be "corrected" in image paths. GHCR
+namespace paths are lowercase regardless:
+`ghcr.io/nerqiva/reuseable-github-actions`.
 
 ## What you get
 
@@ -70,7 +71,7 @@ chmod +x scripts/compute-calver.sh
 ```bash
 # 2. Set the repository Variables (Settings → Secrets and variables → Actions)
 #    These are what the workflows fall back to on push events, where no
-#    workflow_dispatch input exists.
+#    workflow_dispatch input exists. Requires repo admin.
 #    IMAGE_NAME=ghcr.io/your-org/your-repo      (lowercase only)
 #    DOCKERFILE=./Dockerfile
 #    BUILD_CONTEXT=.
@@ -137,6 +138,7 @@ Also read, for image labels only: `IMAGE_LICENSE` (defaults to `unknown`).
 | `cgo_enabled` | `CGO_ENABLED` | string | `0` | `0` keeps the output static and Debian-compatible. |
 | `strip_binary` | `STRIP_BINARY` | string `true`\|`false` | `true` | Strip before packaging. |
 | `verify_image` | `VERIFY_IMAGE` | string | `debian:bookworm-slim` | Container used to prove the binary actually runs. |
+| `verify_args` | `VERIFY_ARGS` | string | `--version` | Argument the verify job passes to the binary. **Contract: the binary must accept it and exit 0.** Point it at whatever your CLI accepts, or set it empty to run with no arguments. |
 | `prerelease` | `PRERELEASE` | string `true`\|`false` | `false` | Mark the release as a pre-release. A pre-release is still immutable — promoting one to a full release later is a deliberate act on the same version, never a re-publish under a new one. |
 | `allow_existing_version` | `ALLOW_EXISTING_VERSION` | string `true`\|`false` | `false` | **Recovery hatch only.** Leave it off. |
 

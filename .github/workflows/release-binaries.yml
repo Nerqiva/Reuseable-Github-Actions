@@ -42,6 +42,13 @@ on:
         description: 'Container image used to prove the binary runs on Debian. Repo Variable: VERIFY_IMAGE'
         required: false
         default: 'debian:bookworm-slim'
+      verify_args:
+        # CONTRACT: the binary must accept this argument and exit 0. Most CLIs
+        # implement --version; if yours does not, point this at whatever it does
+        # accept, or leave it empty to run the binary with no arguments.
+        description: 'Argument used to smoke-test the binary in the verify job. Repo Variable: VERIFY_ARGS'
+        required: false
+        default: '--version'
       prerelease:
         # String, for the same reason as allow_existing_version below.
         description: "Mark the release as a pre-release ('true'/'false'). Repo Variable: PRERELEASE"
@@ -360,6 +367,7 @@ jobs:
           # override vars.VERIFY_IMAGE. It must be an image in which the binary
           # is expected to work — that is the whole point of the check.
           VERIFY_IMAGE: ${{ inputs.verify_image || vars.VERIFY_IMAGE || 'debian:bookworm-slim' }}
+          VERIFY_ARGS: ${{ inputs.verify_args || vars.VERIFY_ARGS || '--version' }}
         run: |
           set -euo pipefail
           # The archive deliberately also ships README and LICENSE, so the
@@ -374,10 +382,14 @@ jobs:
           binary="$(basename "${binaries[0]}")"
           echo "Verifying $binary (linux/$GOARCH) inside $VERIFY_IMAGE"
 
+          # VERIFY_ARGS is a space-separated argument list. Word-splitting is
+          # intended here, so shellcheck-style quoting rules do not apply.
+          read -r -a verify_args <<<"$VERIFY_ARGS"
+
           # $PWD is mounted read-only: the container must never be able to
           # mutate the assets it is being judged on.
           docker pull "$VERIFY_IMAGE"
-          if ! output="$(docker run --rm -v "$PWD:/w:ro" "$VERIFY_IMAGE" "/w/verify/run/$binary" --version 2>&1)"; then
+          if ! output="$(docker run --rm -v "$PWD:/w:ro" "$VERIFY_IMAGE" "/w/verify/run/$binary" "${verify_args[@]}" 2>&1)"; then
             echo "::error::$binary failed to execute on $VERIFY_IMAGE (linux/$GOARCH)."
             printf '%s\n' "$output"
             exit 1

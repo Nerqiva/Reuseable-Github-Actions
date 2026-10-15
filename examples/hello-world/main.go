@@ -19,10 +19,20 @@ var version = "dev"
 
 func main() {
 	var (
-		name  = flag.String("name", "world", "who to greet")
-		shout = flag.Bool("shout", false, "greet in upper case")
+		name    = flag.String("name", "world", "who to greet")
+		shout   = flag.Bool("shout", false, "greet in upper case")
+		showVer = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+
+	// The release workflow's verify job runs the binary with --version and
+	// treats a non-zero exit as "this does not run on our Debian image". A CLI
+	// that cannot be asked what it is cannot be smoke-tested, so --version is
+	// part of the contract, not a nicety.
+	if *showVer {
+		fmt.Println("hello-world", version)
+		return
+	}
 
 	greeting := fmt.Sprintf("hello, %s", *name)
 	if *shout {

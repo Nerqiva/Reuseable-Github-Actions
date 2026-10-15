@@ -121,6 +121,14 @@ jobs:
       image: ${{ steps.digest.outputs.image }}
       version: ${{ steps.digest.outputs.version }}
     steps:
+      # The build context has to exist on disk. The version job checks out the
+      # repository, but jobs do not share a workspace -- without this step the
+      # build context is simply an empty directory and every path fails with
+      # "path ... not found". Shallow is fine here: nothing in this job counts
+      # commits, the version job already did that.
+      - name: Check out repository
+        uses: actions/checkout@v7
+
       - name: Resolve build configuration
         id: config
         env:
