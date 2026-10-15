@@ -73,10 +73,9 @@ repo's workflows.
 ### Git conventions
 
 - Identity is fixed globally in `~/.gitconfig` — see *Repo identity note*.
-- Every project is under Git — `git init` before making changes.
-- Default remote owner is the **`Nerqiva`** org, never a personal account.
-- Small, reviewable commits. No amend, no force-push unless explicitly asked.
-- Do not create a GitHub remote, repository, or release unless explicitly asked.
+- Everything else — `git init`, remote owner, commit hygiene, unrequested
+  creation — is a cross-project rule owned by the global `AGENTS.md`. It applies
+  here and is deliberately not restated.
 
 ### Editing conventions for this repo
 
