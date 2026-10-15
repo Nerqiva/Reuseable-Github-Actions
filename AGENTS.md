@@ -112,7 +112,10 @@ Commit author is the GitHub noreply address
 **globally** in `~/.gitconfig`, because GitHub rejects a push exposing a private
 address into an unverified org. No per-repo override exists here; add none.
 
-## Still open
+## License
 
-- No `LICENSE` has been chosen. The owner must pick one before this repo is
-  advertised for adoption. Do not invent one.
+**MIT** (`LICENSE`). Copy-and-adapt means consumers take these files into their
+own repositories, often proprietary ones, so the license must permit that —
+including commercial use. Keep the copyright and permission notice with any
+substantial copy redistributed. Do not substitute another license without being
+asked.

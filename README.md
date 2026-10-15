@@ -243,9 +243,12 @@ CalVer, format **`vYYYY.MM.DD.MICRO`** — for example `v2026.10.14.3`.
 
 ## License
 
-**No `LICENSE` has been chosen yet.** The owner must select one before this
-repository is advertised for adoption — until then, there is no grant for
-consumers to copy from. Do not assume a license; ask.
+[MIT](LICENSE) — free to use, including commercially. Copy these workflows into
+a proprietary project without restriction; keep the copyright notice and the
+permission notice with any substantial copy you redistribute.
+
+That is deliberate: the point of this repository is that you take the files and
+own them, so the license has to permit exactly that.
 
 Contributions are welcome in the form of a better default, not a
 project-specific special case: the value of this repo is that a copied workflow
